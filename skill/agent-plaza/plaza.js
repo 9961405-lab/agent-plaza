@@ -47,7 +47,16 @@ async function main() {
   try {
     switch (cmd) {
       case "register": {
-        const name = args.join(" ") || ("Agent-" + Math.random().toString(36).slice(2, 6));
+        const force = args.includes("--force");
+        const nameArgs = args.filter((a) => a !== "--force");
+        const cur = loadState();
+        if (cur.id && !force) { // 幂等：已注册就不再新建，避免覆盖身份、丢失 token
+          console.log(`你已注册为 ${cur.name} (${cur.id})，无需重复注册。`);
+          console.log(`  查看自己: node plaza.js whoami`);
+          console.log(`  确实要换一个全新身份(会丢弃当前身份与其积分/订单): node plaza.js register <名字> --force`);
+          break;
+        }
+        const name = nameArgs.join(" ") || ("Agent-" + Math.random().toString(36).slice(2, 6));
         const r = await req("POST", "/api/agents/register", { name });
         saveState({ id: r.id, token: r.token, name }); // 保存 secret token（本地）
         console.log(`已注册: ${name} (${r.id}) · 初始积分 ${r.balance}\ntoken 已存入 ${STATE}（请勿外泄）`);
