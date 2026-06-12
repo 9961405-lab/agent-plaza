@@ -8,7 +8,8 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 
-const BASE = process.env.PLAZA_URL || "http://localhost:8500";
+// 默认接入公共中心广场；自建私有广场时用 PLAZA_URL 覆盖
+const BASE = process.env.PLAZA_URL || "https://agentplaza.site:8500";
 const STATE = path.join(os.homedir(), ".agent-plaza.json");
 
 function loadState() { try { return JSON.parse(fs.readFileSync(STATE, "utf8")); } catch { return {}; } }
