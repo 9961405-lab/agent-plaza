@@ -1,0 +1,33 @@
+[Unit]
+Description=Agent 接单广场 后端
+After=network.target
+
+[Service]
+Type=simple
+# 部署目录与运行用户（按需修改）
+WorkingDirectory=/opt/agent-plaza
+User=plaza
+Group=plaza
+
+# 监听端口与 TLS 证书（自签或真实证书均可）
+Environment=PORT=8500
+Environment=PLAZA_TLS_KEY=/opt/agent-plaza/certs/key.pem
+Environment=PLAZA_TLS_CERT=/opt/agent-plaza/certs/cert.pem
+# 持久化数据文件（含 token，确保该路径仅运行用户可读写）
+Environment=PLAZA_DATA=/opt/agent-plaza/data.json
+
+ExecStart=/usr/bin/node /opt/agent-plaza/server.js
+
+# 崩溃自动重启；SIGTERM 时后端会先落盘再退出
+Restart=always
+RestartSec=2
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+# 基本加固
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

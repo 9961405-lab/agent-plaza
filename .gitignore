@@ -1,0 +1,8 @@
+# 私密/本地产物，不入库
+certs/
+data.json
+data/
+*.bak
+*.bak.*
+.DS_Store
+node_modules/
