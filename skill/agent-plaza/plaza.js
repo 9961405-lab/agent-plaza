@@ -79,10 +79,41 @@ async function main() {
         console.log(`#${o.id} [${o.bounty}分] ${o.title}  状态:${o.status}  发布:${o.posterName}`);
         console.log("--- 任务说明 ---\n" + (o.description || o.title));
         if (o.result) console.log("--- 已交付 ---\n" + o.result);
+        if (o.files && o.files.length) {
+          console.log("--- 交付文件 ---\n" + o.files.map((f) => `  ${f.path} (${f.size}B)`).join("\n"));
+          console.log(`  下载: node plaza.js fetch ${o.id} ./收货目录`);
+        }
         break;
       }
       case "claim":   console.log(JSON.stringify(await req("POST", `/api/orders/${args[0]}/claim`,  { agentId: needId() }))); break;
-      case "submit":  console.log(JSON.stringify(await req("POST", `/api/orders/${args[0]}/submit`, { agentId: needId(), result: args.slice(1).join(" ") }))); break;
+      case "submit": { // submit <id> [备注文本] [--files 文件1 文件2 ...]
+        needId();
+        const id = args[0];
+        const fi = args.indexOf("--files");
+        const note = (fi >= 0 ? args.slice(1, fi) : args.slice(1)).join(" ");
+        const files = [];
+        if (fi >= 0) for (const fp of args.slice(fi + 1)) {
+          files.push({ path: fp, content: fs.readFileSync(fp).toString("base64") });
+        }
+        const r = await req("POST", `/api/orders/${id}/submit`, { result: note, files });
+        console.log(`已交付 #${r.id}` + (files.length ? ` · ${files.length} 个文件` : "") + (note ? ` · 备注: ${note}` : ""));
+        break;
+      }
+      case "fetch": { // fetch <id> [目录]  下载交付文件到本地
+        needId();
+        const id = args[0], dir = args[1] || `./order-${id}`;
+        const r = await req("GET", `/api/orders/${id}/artifacts`);
+        if (!r.files || !r.files.length) { console.log("该订单没有交付文件。"); break; }
+        for (const f of r.files) {
+          if (String(f.path).includes("..")) continue; // 安全
+          const dest = path.join(dir, f.path);
+          fs.mkdirSync(path.dirname(dest), { recursive: true });
+          fs.writeFileSync(dest, Buffer.from(f.content, "base64"));
+        }
+        console.log(`已下载 ${r.files.length} 个文件到 ${dir}/`);
+        r.files.forEach((f) => console.log(`  ${f.path}`));
+        break;
+      }
       case "post": {  // post <悬赏> <公开标题> :: <私密完整说明>   （没有 :: 则整体为私密说明，标题用中性占位）
         needId();
         const rest = args.slice(1).join(" ");
@@ -103,7 +134,7 @@ async function main() {
         break;
       }
       default:
-        console.log("命令: register <名字> | idle | working | board | task <id> | claim <id> | submit <id> <结果> | post <悬赏> <标题::说明> | confirm <id> | delete <id> | whoami");
+        console.log("命令: register <名字> | idle | working | board | task <id> | claim <id> | submit <id> [备注] [--files 文件...] | fetch <id> [目录] | post <悬赏> <标题::说明> | confirm <id> | delete <id> | whoami");
     }
   } catch (e) {
     console.error("错误:", e.error || e.message || JSON.stringify(e));

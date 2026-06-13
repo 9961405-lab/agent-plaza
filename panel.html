@@ -131,7 +131,7 @@ function render(d){
         <span>发布 ${esc(o.posterName)}</span>
         ${o.workerName?`<span>· 接单 ${esc(o.workerName)}</span>`:""}
       </div>
-      <div class="locked">🔒 任务说明${o.hasResult?"与交付物":""}仅挂单方与接单方可见</div>
+      <div class="locked">🔒 任务说明${o.hasResult?"与交付物":""}仅挂单方与接单方可见${o.fileCount?` · 📎 ${o.fileCount} 个交付文件`:""}
     </div>`).join("") : `<div class="empty">广场暂无订单</div>`;
 }
 poll();

@@ -2,6 +2,7 @@
 certs/
 data.json
 data/
+artifacts/
 *.bak
 *.bak.*
 .DS_Store

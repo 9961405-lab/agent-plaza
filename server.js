@@ -7,10 +7,14 @@ const fs = require("fs");
 const path = require("path");
 
 const PORT = process.env.PORT || 8500;
-const OFFLINE_MS = 15000;          // 超过 15s 没心跳视为离线
-const RETENTION_MS = 24 * 3600e3;  // 已结束订单(done/rejected/expired)保留期，过后自动清除
-const SWEEP_MS = 60e3;             // 每 60s 扫一次过期数据
+const OFFLINE_MS = 15000;            // 超过 15s 没心跳视为离线
+const RETENTION_MS = (+process.env.PLAZA_RETENTION_H || 24) * 3600e3;   // 已结束订单保留期，过后自动清除
+const ORDER_TTL_MS = (+process.env.PLAZA_ORDER_TTL_H || 24) * 3600e3;   // open 订单默认有效期，超时无人接则过期退款
+const CONFIRM_TIMEOUT_MS = (+process.env.PLAZA_CONFIRM_TIMEOUT_H || 48) * 3600e3; // 交付后挂单方不确认，超时自动放款
+const SWEEP_MS = +process.env.PLAZA_SWEEP_MS || 60e3;                   // 扫描周期
+const MAX_BODY = 25 * 1024 * 1024;   // 请求体上限 25MB（含文件交付物 base64）
 const DATA_FILE = process.env.PLAZA_DATA || path.join(__dirname, "data.json"); // 持久化文件
+const ARTIFACTS_DIR = process.env.PLAZA_ARTIFACTS || path.join(path.dirname(DATA_FILE), "artifacts"); // 交付文件存储
 
 // ---------- 存储（内存 + 落盘持久化，重启自动恢复） ----------
 const agents = new Map(); // id -> {id,token,name,status,balance,completed,lastSeen}
@@ -44,10 +48,46 @@ function send(res, code, data) {
 }
 function readBody(req) {
   return new Promise((resolve) => {
-    let b = "";
-    req.on("data", (c) => (b += c));
-    req.on("end", () => { try { resolve(b ? JSON.parse(b) : {}); } catch { resolve({}); } });
+    let b = "", tooBig = false;
+    req.on("data", (c) => { b += c; if (b.length > MAX_BODY) { tooBig = true; req.destroy(); } });
+    req.on("end", () => { if (tooBig) return resolve({ __tooBig: true }); try { resolve(b ? JSON.parse(b) : {}); } catch { resolve({}); } });
+    req.on("error", () => resolve(tooBig ? { __tooBig: true } : {}));
   });
+}
+// 交付文件存取（存磁盘，不进 data.json）。路径做安全清洗，防目录穿越
+function safeRel(p) {
+  return String(p).replace(/\\/g, "/").replace(/^(\.\.?\/)+/, "").split("/")
+    .filter((s) => s && s !== "." && s !== "..").join("/") || "file";
+}
+function saveArtifacts(orderId, files) { // files: [{path, content(base64)}]
+  const dir = path.join(ARTIFACTS_DIR, String(orderId));
+  fs.mkdirSync(dir, { recursive: true });
+  const meta = [];
+  for (const f of files) {
+    const rel = safeRel(f.path);
+    const dest = path.join(dir, rel);
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    const buf = Buffer.from(f.content || "", "base64");
+    fs.writeFileSync(dest, buf);
+    meta.push({ path: rel, size: buf.length });
+  }
+  return meta;
+}
+function readArtifacts(orderId) {
+  const dir = path.join(ARTIFACTS_DIR, String(orderId));
+  const out = [];
+  const walk = (d, base) => {
+    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+      const full = path.join(d, e.name), rel = base ? base + "/" + e.name : e.name;
+      if (e.isDirectory()) walk(full, rel);
+      else out.push({ path: rel, content: fs.readFileSync(full).toString("base64") });
+    }
+  };
+  try { walk(dir, ""); } catch { /* 无交付文件 */ }
+  return out;
+}
+function removeArtifacts(orderId) {
+  try { fs.rmSync(path.join(ARTIFACTS_DIR, String(orderId)), { recursive: true, force: true }); } catch {}
 }
 function agentView(a) { // 公开视图：绝不含 token
   return {
@@ -59,7 +99,7 @@ function agentView(a) { // 公开视图：绝不含 token
 function orderPublic(o) {
   return { id: o.id, title: o.title, status: o.status, bounty: o.bounty,
     posterName: o.posterName, workerName: o.workerName, createdAt: o.createdAt,
-    hasResult: !!o.result };
+    deadline: o.deadline, hasResult: !!o.result, fileCount: (o.files || []).length };
 }
 // 凭 token 解析出操作者（token 从请求头 x-plaza-token 或 body.token）
 function actor(req, body) {
@@ -69,10 +109,17 @@ function actor(req, body) {
   return null;
 }
 function unauth(res) { return send(res, 401, { error: "缺少或无效的 token，请先 register 获取" }); }
+// 结算放款（手动确认与超时自动确认共用）
+function settleOrder(o) {
+  const worker = agents.get(o.workerId);
+  if (worker) { worker.balance += o.bounty; worker.completed += 1; } // 释放托管→接单方
+  o.status = "done"; dirty = true;
+}
 
 // ---------- 路由 ----------
 async function api(req, res, url) {
   const body = await readBody(req);
+  if (body.__tooBig) return send(res, 413, { error: `请求体过大（上限 ${Math.round(MAX_BODY/1048576)}MB）。大文件/整个仓库请改用链接交付（把下载地址写进交付文本）` });
   const parts = url.pathname.split("/").filter(Boolean); // e.g. ['api','orders','3','claim']
   if (req.method !== "GET" && req.method !== "OPTIONS") dirty = true; // 任何写操作标记待落盘
 
@@ -92,6 +139,15 @@ async function api(req, res, url) {
     if (body.status === "idle" || body.status === "working") a.status = body.status;
     a.lastSeen = now();
     return send(res, 200, { ok: true });
+  }
+
+  // 下载交付文件（需鉴权，仅当事人）: GET /api/orders/:id/artifacts
+  if (req.method === "GET" && parts[1] === "orders" && parts[3] === "artifacts") {
+    const me = actor(req, body); if (!me) return unauth(res);
+    const o = orders.find((x) => x.id === +parts[2]);
+    if (!o) return send(res, 404, { error: "not found" });
+    if (o.posterId !== me.id && o.workerId !== me.id) return send(res, 403, { error: "无权下载该交付物" });
+    return send(res, 200, { files: readArtifacts(o.id) }); // [{path, content(base64)}]
   }
 
   // 读单详情（需鉴权）: GET /api/orders/:id  —— 含任务说明/交付物，按需知最小化授权
@@ -127,9 +183,11 @@ async function api(req, res, url) {
     const desc = (body.description || body.title || "").trim();
     // 公开标题与私密说明分离：不提供 title 时用中性占位，绝不从 description 泄露内容
     const title = (body.title || "").trim().slice(0, 50) || "任务（无公开标题）";
+    const ttl = body.ttlHours > 0 ? body.ttlHours * 3600e3 : ORDER_TTL_MS;
     const o = { id: nextOrderId++, posterId: poster.id, posterName: poster.name,
       workerId: null, workerName: null, status: "open",
-      title, description: desc, bounty, result: null, createdAt: now() };
+      title, description: desc, bounty, result: null, files: [],
+      createdAt: now(), deadline: now() + ttl, submittedAt: null };
     orders.push(o);
     return send(res, 200, o);
   }
@@ -146,16 +204,20 @@ async function api(req, res, url) {
     return send(res, 200, o);
   }
 
-  // 交付: POST /api/orders/:id/submit {result}  —— 凭 token，须为接单方
+  // 交付: POST /api/orders/:id/submit {result, files:[{path,content(base64)}]}  —— 凭 token，须为接单方
   if (req.method === "POST" && parts[1] === "orders" && parts[3] === "submit") {
     const a = actor(req, body); if (!a) return unauth(res);
     const o = orders.find((x) => x.id === +parts[2]);
     if (!o) return send(res, 404, { error: "not found" });
     if (o.workerId !== a.id) return send(res, 403, { error: "不是接单方" });
     if (o.status !== "claimed") return send(res, 409, { error: "状态不允许交付" });
-    o.status = "submitted"; o.result = body.result || "(无内容)";
+    let fileMeta = [];
+    if (Array.isArray(body.files) && body.files.length) fileMeta = saveArtifacts(o.id, body.files);
+    o.files = fileMeta;
+    o.result = body.result || (fileMeta.length ? `(见 ${fileMeta.length} 个交付文件)` : "(无内容)");
+    o.status = "submitted"; o.submittedAt = now();
     a.status = "idle";
-    return send(res, 200, o);
+    return send(res, 200, { ...o });
   }
 
   // 确认付款: POST /api/orders/:id/confirm  —— 凭 token，须为挂单方
@@ -165,9 +227,7 @@ async function api(req, res, url) {
     if (!o) return send(res, 404, { error: "not found" });
     if (o.posterId !== me.id) return send(res, 403, { error: "不是挂单方" });
     if (o.status !== "submitted") return send(res, 409, { error: "无待确认的交付" });
-    const worker = agents.get(o.workerId);
-    if (worker) { worker.balance += o.bounty; worker.completed += 1; } // 释放托管→接单方
-    o.status = "done";
+    settleOrder(o); // 释放托管→接单方
     return send(res, 200, o);
   }
 
@@ -177,7 +237,9 @@ async function api(req, res, url) {
     const o = orders.find((x) => x.id === +parts[2]);
     if (!o) return send(res, 404, { error: "not found" });
     if (o.posterId !== me.id) return send(res, 403, { error: "不是挂单方" });
+    removeArtifacts(o.id); // 退回时清除上一次交付文件，重新开放
     o.status = "open"; o.workerId = null; o.workerName = null; o.result = null;
+    o.files = []; o.submittedAt = null; o.deadline = now() + ORDER_TTL_MS;
     return send(res, 200, o);
   }
 
@@ -192,6 +254,7 @@ async function api(req, res, url) {
     if (o.status === "claimed" || o.status === "submitted")
       return send(res, 409, { error: "订单进行中，不能删除（先 confirm 或 reject）" });
     if (o.status === "open") { const p = agents.get(o.posterId); if (p) p.balance += o.bounty; } // 退还托管
+    removeArtifacts(o.id);
     orders.splice(idx, 1); // 彻底删除，任务说明与交付物一并清除
     return send(res, 200, { ok: true, deleted: o.id });
   }
@@ -209,12 +272,24 @@ function serveStatic(res) {
   });
 }
 
-// ---------- 数据保留期：定期清除已结束的旧订单（连同任务说明/交付物） ----------
+// ---------- 定时维护：过期退款 / 确认超时自动放款 / 保留期清理 ----------
 setInterval(() => {
-  const cutoff = now() - RETENTION_MS;
+  const t = now(), cutoff = t - RETENTION_MS;
   for (let i = orders.length - 1; i >= 0; i--) {
     const o = orders[i];
-    if (["done", "rejected", "expired"].includes(o.status) && o.createdAt < cutoff) { orders.splice(i, 1); dirty = true; }
+    // ① open 订单超时无人接 → 过期，退还托管给挂单方
+    if (o.status === "open" && o.deadline && t > o.deadline) {
+      const p = agents.get(o.posterId); if (p) p.balance += o.bounty;
+      o.status = "expired"; dirty = true;
+    }
+    // ② 交付后挂单方迟迟不确认 → 超时自动放款，保护接单方
+    if (o.status === "submitted" && o.submittedAt && t - o.submittedAt > CONFIRM_TIMEOUT_MS) {
+      settleOrder(o); o.autoConfirmed = true;
+    }
+    // ③ 已结束订单过保留期 → 连同交付文件一并清除
+    if (["done", "rejected", "expired"].includes(o.status) && o.createdAt < cutoff) {
+      removeArtifacts(o.id); orders.splice(i, 1); dirty = true;
+    }
   }
 }, SWEEP_MS).unref();
 
